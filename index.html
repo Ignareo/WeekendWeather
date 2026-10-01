@@ -138,6 +138,13 @@ span.worse, td.worse { background: var(--err-soft); color: var(--err); border-ra
 span.better, td.better { background: var(--ok-soft); color: var(--ok); border-radius: 6px; padding: 1px 5px; }
 td svg, .cc-daily svg, .cc-meta svg { vertical-align: -2.5px; margin: 0 1px; }
 .nx { font-style: normal; color: var(--err); font-size: 11px; }
+/* 连游模式：最佳窗口强高亮，窗口外日期淡出 */
+.win-badge { display: inline-block; color: var(--primary); background: var(--primary-soft);
+             border: 1px solid var(--primary); border-radius: 8px; padding: 0 7px;
+             font-size: 12px; font-weight: 700; letter-spacing: .5px; }
+.inwin { background: var(--primary-soft); box-shadow: inset 0 -2.5px 0 var(--primary);
+         border-radius: 6px; padding: 0 4px; font-weight: 700; }
+.nwin { opacity: .38; }
 
 /* ---------- 逐日天气条（详情） ---------- */
 .daystrip { display: flex; margin: 12px 0 6px; overflow-x: auto;
@@ -471,7 +478,9 @@ body[data-theme="dopa"] #toast.err { background: #ff07da; color: #fff; border-co
       </select></label>
     <label>白天 ≤ <input type="number" id="max-day" placeholder="°C"></label>
     <label>夜间 ≥ <input type="number" id="min-night" placeholder="°C"></label>
-    <label>至少 <input type="number" id="need" min="1" placeholder="全部"> 天达标</label>
+    <label id="need-label">至少 <input type="number" id="need" min="1" placeholder="全部"> 天达标</label>
+    <label><input type="checkbox" id="win-mode"> 连游 <input type="number" id="win-days" min="2" max="7" value="3" style="width:56px"> 天最优窗口</label>
+    <span class="warn-text hidden" id="win-note"></span>
     <label><input type="number" id="travel-hours" step="0.5" min="0" placeholder="X"> 小时圈内
       <select id="travel-mode">
         <option value="any">任一方式</option>
@@ -737,6 +746,7 @@ function readFilters() {
     from: v("date-from"), to: v("date-to"),
     rain: v("max-rain"), maxday: v("max-day"), minnight: v("min-night"),
     need: v("need"), hours: v("travel-hours"), mode: $("travel-mode").value,
+    win: $("win-mode").checked ? "1" : "", wind: v("win-days"),
   };
 }
 function applyFilters(f) {
@@ -744,12 +754,28 @@ function applyFilters(f) {
   $("max-rain").value = f.rain || ""; $("max-day").value = f.maxday || "";
   $("min-night").value = f.minnight || ""; $("need").value = f.need || "";
   $("travel-hours").value = f.hours || ""; $("travel-mode").value = f.mode || "any";
+  $("win-mode").checked = f.win === "1" || f.win === true;
+  $("win-days").value = f.wind || "3";
+  syncWinMode();
+}
+// 连游模式下「至少 N 天达标」不适用，禁用并提示
+function syncWinMode() {
+  const on = $("win-mode").checked;
+  $("need").disabled = on;
+  $("need-label").style.opacity = on ? ".45" : "";
+  const note = $("win-note");
+  if (on) {
+    const n = parseInt($("win-days").value) || 3;
+    note.textContent = `已开启：在日期范围内为每城寻找最佳连续 ${n} 天窗口并排序`;
+    note.classList.remove("hidden");
+  } else note.classList.add("hidden");
 }
 function encodeHash() {
   const f = readFilters(); const p = new URLSearchParams();
   p.set("cities", CITIES.join(","));
-  for (const k of ["from","to","rain","maxday","minnight","need","hours"])
+  for (const k of ["from","to","rain","maxday","minnight","need","hours","wind"])
     if (f[k]) p.set(k, f[k]);
+  if (f.win) p.set("win", "1");
   if (f.mode && f.mode !== "any") p.set("mode", f.mode);
   return "#" + p.toString();
 }
@@ -761,7 +787,7 @@ function decodeHash() {
     lsSet(LS.cities, CITIES);
   }
   const f = {};
-  for (const k of ["from","to","rain","maxday","minnight","need","hours","mode"])
+  for (const k of ["from","to","rain","maxday","minnight","need","hours","mode","wind","win"])
     if (p.get(k)) f[k] = p.get(k);
   applyFilters(f);
   return true;
@@ -971,6 +997,7 @@ function currentCriteria() {
     maxDay: num(f.maxday), minNight: num(f.minnight),
     need: f.need === "" ? null : parseInt(f.need),
     hours: num(f.hours), mode: f.mode || "any",
+    win: f.win === "1" || f.win === true, winDays: parseInt(f.wind) || 3,
   };
 }
 function dayOk(d, c) {
@@ -989,6 +1016,8 @@ function summarize() {
   const c = currentCriteria();
   const allDates = [...new Set([...DATA.cities.values()].flatMap(x => x.days.map(d => d.date)))].sort();
   const days = allDates.filter(d => (!c.from || d >= c.from) && (!c.to || d <= c.to));
+  if (c.win && days.length >= c.winDays) return summarizeWindows(c, days);
+  const winShort = c.win && days.length < c.winDays ? c.winDays : null;
   const need = c.need !== null ? c.need : days.length;
   const summaries = [], filtered = [];
   for (const [name, cd] of DATA.cities) {
@@ -1017,7 +1046,56 @@ function summarize() {
   }
   // 达标天数多→少, 综合雨况好→差, 白天最高温低→高 (温度缺失的排最后)
   summaries.sort((a, b) => b.ok - a.ok || a.worst - b.worst || (a.dayHi ?? 999) - (b.dayHi ?? 999));
-  return { summaries, days, need, total: DATA.cities.size, filteredCount: filtered.length };
+  return { summaries, days, need, winShort, total: DATA.cities.size, filteredCount: filtered.length };
+}
+/* 连游模式：在日期范围内滑动扫描连续 N 天窗口，每城取最优窗口，再按窗口质量排序 */
+function winCmp(a, b) {
+  return b.ok - a.ok || a.worst - b.worst || a.totalPrecip - b.totalPrecip || a.dayHi - b.dayHi;
+}
+function summarizeWindows(c, days) {
+  const N = c.winDays;
+  const summaries = [], filtered = [];
+  for (const [name, cd] of DATA.cities) {
+    if (!travelOk(name, c)) { filtered.push(name); continue; }
+    const daymap = new Map(cd.days.map(d => [d.date, d]));
+    let best = null;
+    for (let i = 0; i + N <= days.length; i++) {
+      const winDates = days.slice(i, i + N);
+      if (winDates.some(d => !daymap.has(d))) continue;   // 窗口内须每天都有数据
+      const win = winDates.map(d => daymap.get(d));
+      const s = {
+        i, from: winDates[0], to: winDates[N - 1],
+        ok: win.filter(d => dayOk(d, c)).length,
+        worst: Math.max(...win.map(d => d.tier)),
+        totalPrecip: win.reduce((x, d) => x + (d.precip || 0), 0),
+        dayHi: Math.max(...win.map(d => d.dayTemp ?? -Infinity)),
+      };
+      if (!best || winCmp(s, best) < 0) best = s;
+    }
+    if (!best) { filtered.push(name); continue; }
+    const winDates = days.slice(best.i, best.i + N);
+    const wtemps = k => winDates.map(d => daymap.get(d)[k]).filter(v => v !== null);
+    const dayTemps = wtemps("dayTemp"), nightTemps = wtemps("nightTemp");
+    summaries.push({
+      name, province: cd.province, cd,
+      ok: best.ok, nDays: N, winFrom: best.from, winTo: best.to,
+      daily: days.map(d => {
+        const dd = daymap.get(d);
+        return { date: d, icon: dd ? RAIN_ICONS[dd.tier] : "—", tier: dd ? dd.tier : -1,
+                 ok: dd ? dayOk(dd, c) : false, inWin: winDates.includes(d) };
+      }),
+      worst: best.worst,
+      dayLo: dayTemps.length ? Math.min(...dayTemps) : null,
+      dayHi: dayTemps.length ? Math.max(...dayTemps) : null,
+      nightLo: nightTemps.length ? Math.min(...nightTemps) : null,
+      nightHi: nightTemps.length ? Math.max(...nightTemps) : null,
+      totalPrecip: best.totalPrecip,
+    });
+  }
+  // 与固定范围模式同一口径：达标天数→最差天雨况→总降水→白天最高温
+  summaries.sort((a, b) => b.ok - a.ok || a.worst - b.worst
+    || a.totalPrecip - b.totalPrecip || (a.dayHi ?? 999) - (b.dayHi ?? 999));
+  return { summaries, days, need: null, win: N, total: DATA.cities.size, filteredCount: filtered.length };
 }
 
 /* ================= 快照与变更对比（阶段五） ================= */
@@ -1116,11 +1194,13 @@ function renderTable(res) {
     const tr = document.createElement("tr"); tr.className = "city-row";
     const dailyHtml = s.daily.map(d => {
       const hl = LAST_DIFF && LAST_DIFF[`${s.name}|${d.date}`];
-      const cls = hl === "worse" ? ' class="worse"' : hl === "better" ? ' class="better"' : "";
-      return `<span${cls}>${d.date.slice(8)}${d.tier >= 0 ? tierIcon(d.tier) : "—"}${d.ok ? "" : '<em class="nx">✗</em>'}</span>`;
+      const cls = [hl === "worse" ? "worse" : hl === "better" ? "better" : "",
+                   d.inWin ? "inwin" : res.win && !hl ? "nwin" : ""].filter(Boolean).join(" ");
+      return `<span${cls ? ` class="${cls}"` : ""}>${d.date.slice(8)}${d.tier >= 0 ? tierIcon(d.tier) : "—"}${d.ok ? "" : '<em class="nx">✗</em>'}</span>`;
     }).join(" ");
     tr.innerHTML =
-      `<td>${s.name}</td><td>${s.ok}/${s.nDays}</td><td>${dailyHtml}</td>` +
+      `<td>${s.name}</td>` +
+      `<td>${s.winFrom ? `<span class="win-badge">${mmdd(s.winFrom)} ~ ${mmdd(s.winTo)}</span><br>` : ""}${s.ok}/${s.nDays}</td><td>${dailyHtml}</td>` +
       `<td>${tierIcon(s.worst, 15)} ${RAIN_TEXT[s.worst]}</td>` +
       `<td>${fmtRange(s.dayLo, s.dayHi)}</td>` +
       `<td>${fmtRange(s.nightLo, s.nightHi)}</td>` +
@@ -1135,7 +1215,9 @@ function renderTable(res) {
   }
   $("result-meta").textContent =
     `符合条件 ${res.summaries.length} / ${res.total} 个城市` +
-    (res.days.length ? ` (${mmdd(res.days[0])}~${mmdd(res.days[res.days.length-1])}, 至少 ${res.need}/${res.days.length} 天达标)` : "") +
+    (res.win ? ` (连游 ${res.win} 天最优窗口 · 范围 ${mmdd(res.days[0])}~${mmdd(res.days[res.days.length-1])}，加粗下划线 = 该城最佳窗口)` : "") +
+    (res.winShort ? ` · ⚠️ 连游 ${res.winShort} 天需要至少 ${res.winShort} 天的日期范围，已按固定范围模式计算` : "") +
+    (!res.win && res.days.length ? ` (${mmdd(res.days[0])}~${mmdd(res.days[res.days.length-1])}, 至少 ${res.need}/${res.days.length} 天达标)` : "") +
     ` · 点击城市展开详情`;
   renderCards(res);
 }
@@ -1153,13 +1235,14 @@ function renderCards(res) {
     const card = document.createElement("div"); card.className = "city-card";
     const daily = s.daily.map(d => {
       const hl = LAST_DIFF && LAST_DIFF[`${s.name}|${d.date}`];
-      const cls = hl === "worse" ? ' class="worse"' : hl === "better" ? ' class="better"' : "";
-      return `<span${cls}>${d.date.slice(8)}${d.tier >= 0 ? tierIcon(d.tier) : "—"}${d.ok ? "" : '<em class="nx">✗</em>'}</span>`;
+      const cls = [hl === "worse" ? "worse" : hl === "better" ? "better" : "",
+                   d.inWin ? "inwin" : res.win && !hl ? "nwin" : ""].filter(Boolean).join(" ");
+      return `<span${cls ? ` class="${cls}"` : ""}>${d.date.slice(8)}${d.tier >= 0 ? tierIcon(d.tier) : "—"}${d.ok ? "" : '<em class="nx">✗</em>'}</span>`;
     }).join("");
     const travel = fmtTravel(s.name);
     card.innerHTML =
       `<div class="cc-head"><span class="cc-name">${s.name}</span>` +
-      `<span class="cc-ok">达标 ${s.ok}/${s.nDays}</span></div>` +
+      `<span class="cc-ok">${s.winFrom ? `<span class="win-badge">${mmdd(s.winFrom)} ~ ${mmdd(s.winTo)}</span> ` : ""}达标 ${s.ok}/${s.nDays}</span></div>` +
       `<div class="cc-daily">${daily}</div>` +
       `<div class="cc-meta"><span>${tierIcon(s.worst, 14)} ${RAIN_TEXT[s.worst]}</span>` +
       `<span>白天 ${fmtRange(s.dayLo, s.dayHi)} · 夜间 ${fmtRange(s.nightLo, s.nightHi)}</span>` +
@@ -1234,11 +1317,13 @@ function buildTextSummary() {
   const res = LAST_RESULT; if (!res) return "";
   const lines = [];
   lines.push(`符合条件: ${res.summaries.length} / ${res.total} 个城市` +
-    (res.days.length ? ` (${mmdd(res.days[0])}~${mmdd(res.days[res.days.length-1])}, 至少 ${res.need}/${res.days.length} 天达标)` : ""));
-  lines.push("城市\t达标\t逐日雨况(✗=不达标)\t综合雨况\t白天温度\t夜间温度\t总降水\t发报时间");
+    (res.win ? ` (连游 ${res.win} 天最优窗口, 范围 ${mmdd(res.days[0])}~${mmdd(res.days[res.days.length-1])})` : "") +
+    (!res.win && res.days.length ? ` (${mmdd(res.days[0])}~${mmdd(res.days[res.days.length-1])}, 至少 ${res.need}/${res.days.length} 天达标)` : ""));
+  lines.push("城市\t达标\t逐日雨况(✗=不达标, 高亮=最佳窗口)\t综合雨况\t白天温度\t夜间温度\t总降水\t发报时间");
   for (const s of res.summaries) {
     const daily = s.daily.map(d => `${d.date.slice(8)}${d.icon}${d.ok ? "" : "✗"}`).join(" ");
-    lines.push([s.name, `${s.ok}/${s.nDays}`, daily, RAIN_LABELS[s.worst],
+    lines.push([s.name, (s.winFrom ? `${mmdd(s.winFrom)}~${mmdd(s.winTo)} ` : "") + `${s.ok}/${s.nDays}`,
+      daily, RAIN_LABELS[s.worst],
       fmtRange(s.dayLo, s.dayHi), fmtRange(s.nightLo, s.nightHi),
       `${s.totalPrecip.toFixed(1)}mm`, s.cd.publishTime || "—"].join("\t"));
   }
@@ -1265,13 +1350,17 @@ function exportCSV() {
   const lines = [];
   lines.push(["数据获取时间", `${fmtDT(fetched)}（${srcLabel}）`].map(q).join(","));
   lines.push(["筛选日期范围", res.days.length ? `${res.days[0]} ~ ${res.days[res.days.length - 1]}` : "（无）"].map(q).join(","));
+  if (res.win) lines.push(["模式", `连游 ${res.win} 天最优窗口（每城导出其最佳窗口的逐日数据）`].map(q).join(","));
   lines.push(["符合条件", `${res.summaries.length} / ${res.total} 个城市`].map(q).join(","));
   lines.push("");
   lines.push(["城市", "省份", "日期", "星期", "白天天气", "白天温度(°C)", "夜间天气", "夜间温度(°C)",
     "白天风向", "白天风力", "夜间风向", "夜间风力", "降水量(mm)", "是否达标"].map(q).join(","));
   for (const s of res.summaries) {
     const daymap = new Map(s.cd.days.map(d => [d.date, d]));
-    for (const dstr of res.days) {
+    const dateList = res.win
+      ? s.daily.filter(d => d.inWin).map(d => d.date)
+      : res.days;
+    for (const dstr of dateList) {
       const d = daymap.get(dstr); if (!d) continue;
       lines.push([s.name, s.province, d.date, wday(d.date), d.dayInfo, d.dayTemp ?? "", d.nightInfo,
         d.nightTemp ?? "", d.dayWindD, d.dayWindP, d.nightWindD, d.nightWindP, d.precip,
@@ -1284,7 +1373,7 @@ function exportCSV() {
   a.download = `周末去哪_天气筛选_${iso(fetched)}.csv`;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-  toast(`已导出 CSV：${res.summaries.length} 城 × ${res.days.length} 天`);
+  toast(`已导出 CSV：${res.summaries.length} 城 × ${res.win || res.days.length} 天`);
 }
 
 /* ================= 城市管理面板（阶段二） ================= */
@@ -1505,6 +1594,8 @@ function onFilterChange() {
 function bindEvents() {
   for (const id of ["date-from","date-to","max-rain","max-day","min-night","need","travel-hours","travel-mode"])
     $(id).addEventListener("change", onFilterChange);
+  $("win-mode").addEventListener("change", () => { syncWinMode(); onFilterChange(); });
+  $("win-days").addEventListener("change", () => { syncWinMode(); onFilterChange(); });
   for (const id of ["range-a","range-b"]) $(id).addEventListener("input", onRangePick);
   $("btn-csv").addEventListener("click", exportCSV);
   $("btn-refresh").addEventListener("click", refresh);
@@ -1599,15 +1690,7 @@ async function init() {
   document.querySelectorAll(".hero-wave img, .foot-wave").forEach(im => { im.src = THEME_DEFS[THEME].img; });
   { const n = new Date(); $("hero-date").textContent = `${n.getMonth() + 1} 月 ${n.getDate()} 日 · ${WEEKDAYS[n.getDay()]}`; }
   const hasHash = decodeHash();
-  if (!hasHash) {
-    applyFilters(lsGet(LS.filters, {}));
-    // 周四/周五打开默认选中"本周末"（无已存条件时）
-    const dow = new Date().getDay();
-    if ((dow === 4 || dow === 5) && !$("date-from").value) {
-      const r = weekendRange(0);
-      $("date-from").value = r.from; $("date-to").value = r.to;
-    }
-  }
+  if (!hasHash) applyFilters(lsGet(LS.filters, {}));
   // 节假日数据过期降级
   try {
     HOLIDAYS = await (await fetch("holidays.json", { cache: "no-store" })).json();
@@ -1618,6 +1701,14 @@ async function init() {
   } catch {
     $("btn-next-holiday").disabled = true;
     $("holiday-hint").textContent = "holidays.json 加载失败，假期快捷按钮不可用";
+  }
+  if (!hasHash && !$("date-from").value) {
+    // 假期中打开默认选中整个假期（连游窗口模式好用）；周四/周五默认选中本周末
+    const today = iso(new Date());
+    const hol = holidayRanges().find(r => r.from <= today && today <= r.to);
+    const r = hol ? { from: hol.from, to: hol.to } :
+      [4, 5].includes(new Date().getDay()) ? weekendRange(0) : null;
+    if (r) { $("date-from").value = r.from; $("date-to").value = r.to; }
   }
   try {
     STATIONS = await (await fetch("stations.json")).json();
